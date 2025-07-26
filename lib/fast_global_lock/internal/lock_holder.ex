@@ -13,7 +13,8 @@ defmodule FastGlobalLock.Internal.LockHolder do
     notified_owner: nil,
     lock_count: 0,
     times: 0,
-    peers: []
+    peers: %{},
+    peer_generation: 0
   ]
 
   @typep state :: %State{
@@ -23,7 +24,8 @@ defmodule FastGlobalLock.Internal.LockHolder do
            notified_owner: Utils.global_owner() | nil,
            lock_count: non_neg_integer(),
            times: non_neg_integer(),
-           peers: [pid()]
+           peers: [pid()],
+           peer_generation: non_neg_integer()
          }
 
   @impl GenServer
@@ -50,8 +52,16 @@ defmodule FastGlobalLock.Internal.LockHolder do
   def handle_cast(:nest_lock, %State{} = state),
     do: {:noreply, %{state | lock_count: state.lock_count + 1}}
 
-  def handle_cast({:awaiting_lock, peer}, %State{} = state),
-    do: {:noreply, %{state | peers: [peer | state.peers]}}
+  def handle_cast({:awaiting_lock, peer}, %State{} = state) when is_map_key(state.peers, peer) do
+    {:noreply, state}
+  end
+
+  def handle_cast({:awaiting_lock, peer}, %State{} = state) do
+    Process.monitor(peer)
+    peer_num = state.peer_generation
+    peers = Map.put(state.peers, peer, peer_num)
+    {:noreply, %{state | peers: peers, peer_generation: peer_num + 1}}
+  end
 
   def handle_cast(:released_lock, %State{} = state),
     do: try_lock(state)
@@ -67,6 +77,9 @@ defmodule FastGlobalLock.Internal.LockHolder do
 
   def handle_info(:timeout, %State{} = state),
     do: try_lock(state)
+
+  def handle_info({:DOWN, _ref, :process, pid, _reason}, %State{} = state),
+    do: {:noreply, %{state | peers: Map.delete(state.peers, pid)}}
 
   @impl GenServer
   def terminate(_reason, %State{} = state),
@@ -99,8 +112,8 @@ defmodule FastGlobalLock.Internal.LockHolder do
     :global.del_lock({state.resource, parent_pid}, state.nodes)
     Process.flag(:trap_exit, false)
 
-    if peer = Enum.find(Enum.reverse(state.peers), &(node(&1) != :nonode@nohost)),
-      do: GenServer.cast(peer, :released_lock)
+    {peer, _} = Enum.min_by(state.peers, fn {_peer, peer_num} -> peer_num end, fn -> {nil, 0} end)
+    if peer, do: GenServer.cast(peer, :released_lock)
 
     :ok
   end
