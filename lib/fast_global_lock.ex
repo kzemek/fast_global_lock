@@ -22,8 +22,11 @@ defmodule FastGlobalLock do
     nodes = nodes || Node.list([:this, :visible])
 
     case Utils.whereis_lock(key, nodes) do
-      nil -> true
-      {_on_behalf_of, {owner_pid, _lock_ref}} -> GenServer.call(owner_pid, :del_lock, :infinity)
+      {on_behalf_of, {owner_pid, _lock_ref}} when on_behalf_of == self() ->
+        GenServer.call(owner_pid, :del_lock, :infinity)
+
+      _ ->
+        true
     end
   end
 
