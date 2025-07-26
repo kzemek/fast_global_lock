@@ -1,6 +1,6 @@
 # FastGlobalLock
 
-**TODO: Add description**
+A `:global`-based `set_lock`/`del_lock` with fast locks under contention through process cooperation.
 
 ## Installation
 
@@ -18,4 +18,3 @@ end
 Documentation can be generated with [ExDoc](https://github.com/elixir-lang/ex_doc)
 and published on [HexDocs](https://hexdocs.pm). Once published, the docs can
 be found at <https://hexdocs.pm/fast_global_lock>.
-
