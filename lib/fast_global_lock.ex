@@ -2,13 +2,13 @@ defmodule FastGlobalLock do
   alias FastGlobalLock.Internal.LockHolder
   alias FastGlobalLock.Internal.Utils
 
-  @spec set_lock(key :: term(), [node()] | nil, timeout :: non_neg_integer() | :infinity) ::
-          boolean
+  @spec set_lock(key :: term(), [node()] | nil, timeout()) :: boolean()
   def set_lock(key, nodes \\ nil, timeout \\ :infinity) do
     nodes = nodes || Node.list([:this, :visible])
 
     case Utils.whereis_lock(key, nodes) do
-      {on_behalf_of, _owner} when on_behalf_of == self() ->
+      {on_behalf_of, {owner_pid, _lock_ref}} when on_behalf_of == self() ->
+        GenServer.cast(owner_pid, :nest_lock)
         true
 
       _ ->

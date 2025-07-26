@@ -5,15 +5,13 @@ defmodule FastGlobalLock.Internal.LockHolder do
   alias __MODULE__, as: State
   alias FastGlobalLock.Internal.Utils, as: Utils
 
-  @typep global_owner :: {pid(), reference()}
-
   @enforce_keys [:resource, :nodes]
   defstruct [
     :resource,
     :nodes,
     parent: nil,
     notified_owner: nil,
-    locked?: false,
+    lock_count: 0,
     times: 0,
     peers: []
   ]
@@ -22,8 +20,8 @@ defmodule FastGlobalLock.Internal.LockHolder do
            resource: term(),
            nodes: [node()],
            parent: GenServer.from() | nil,
-           notified_owner: global_owner() | nil,
-           locked?: boolean(),
+           notified_owner: Utils.global_owner() | nil,
+           lock_count: non_neg_integer(),
            times: non_neg_integer(),
            peers: [pid()]
          }
@@ -33,18 +31,25 @@ defmodule FastGlobalLock.Internal.LockHolder do
     do: {:ok, %State{resource: resource, nodes: nodes}}
 
   @impl GenServer
-  def handle_call({:set_lock, timeout}, parent, %State{locked?: false} = state) do
+  def handle_call({:set_lock, timeout}, parent, %State{lock_count: 0} = state) do
     if timeout != :infinity, do: :erlang.send_after(timeout, self(), :lock_timeout)
     try_lock(%{state | parent: parent})
   end
 
-  def handle_call(:del_lock, from, %State{locked?: true} = state) do
+  def handle_call(:del_lock, from, %State{lock_count: 1} = state) do
     del_lock(state)
     GenServer.reply(from, true)
-    {:stop, :normal, %{state | locked?: false}}
+    {:stop, :normal, %{state | lock_count: 0}}
+  end
+
+  def handle_call(:del_lock, _from, %State{lock_count: lock_count} = state) when lock_count > 0 do
+    {:reply, true, %{state | lock_count: lock_count - 1}}
   end
 
   @impl GenServer
+  def handle_cast(:nest_lock, %State{} = state),
+    do: {:noreply, %{state | lock_count: state.lock_count + 1}}
+
   def handle_cast({:awaiting_lock, peer}, %State{} = state),
     do: {:noreply, %{state | peers: [peer | state.peers]}}
 
@@ -52,12 +57,12 @@ defmodule FastGlobalLock.Internal.LockHolder do
     do: try_lock(state)
 
   @impl GenServer
-  def handle_info(:lock_timeout, %State{locked?: false} = state) do
+  def handle_info(:lock_timeout, %State{lock_count: 0} = state) do
     GenServer.reply(state.parent, false)
     {:stop, :normal, state}
   end
 
-  def handle_info(:lock_timeout, %State{locked?: true} = state),
+  def handle_info(:lock_timeout, %State{} = state),
     do: {:noreply, state}
 
   def handle_info(:timeout, %State{} = state),
@@ -68,14 +73,14 @@ defmodule FastGlobalLock.Internal.LockHolder do
     do: del_lock(state)
 
   @spec try_lock(state()) :: {:noreply, state()} | {:noreply, state(), timeout()}
-  defp try_lock(%State{locked?: true} = state),
+  defp try_lock(%State{lock_count: lock_count} = state) when lock_count > 0,
     do: {:noreply, state}
 
   defp try_lock(%State{parent: {parent_pid, _tag}} = state) do
     if :global.set_lock({state.resource, parent_pid}, state.nodes, 0) do
       GenServer.reply(state.parent, true)
       Process.flag(:trap_exit, true)
-      {:noreply, %{state | locked?: true}}
+      {:noreply, %{state | lock_count: state.lock_count + 1}}
     else
       notified_owner = notify_lock_owner(state.resource, state.nodes, state.notified_owner)
       new_state = %{state | notified_owner: notified_owner, times: state.times + 1}
@@ -87,7 +92,7 @@ defmodule FastGlobalLock.Internal.LockHolder do
   end
 
   @spec del_lock(state()) :: :ok
-  defp del_lock(%State{locked?: false}),
+  defp del_lock(%State{lock_count: 0}),
     do: :ok
 
   defp del_lock(%State{parent: {parent_pid, _tag}} = state) do
@@ -100,7 +105,8 @@ defmodule FastGlobalLock.Internal.LockHolder do
     :ok
   end
 
-  @spec notify_lock_owner(term(), [node()], global_owner() | nil) :: global_owner() | nil
+  @spec notify_lock_owner(term(), [node()], Utils.global_owner() | nil) ::
+          Utils.global_owner() | nil
   defp notify_lock_owner(resource, nodes, previously_notified_owner) do
     case Utils.whereis_lock(resource, nodes) do
       nil -> nil
