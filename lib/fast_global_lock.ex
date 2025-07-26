@@ -26,4 +26,19 @@ defmodule FastGlobalLock do
       {_on_behalf_of, {owner_pid, _lock_ref}} -> GenServer.call(owner_pid, :del_lock, :infinity)
     end
   end
+
+  @spec trans(key :: term(), fun :: (-> any()), [node()] | nil, timeout()) :: any() | :aborted
+  def trans(key, fun, nodes \\ nil, timeout \\ :infinity) do
+    nodes = nodes || Node.list([:this, :visible])
+
+    if set_lock(key, nodes, timeout) do
+      try do
+        fun.()
+      after
+        del_lock(key, nodes)
+      end
+    else
+      :aborted
+    end
+  end
 end
