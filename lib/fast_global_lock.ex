@@ -2,18 +2,17 @@ defmodule FastGlobalLock do
   alias FastGlobalLock.Internal.LockHolder
   alias FastGlobalLock.Internal.Utils
 
-  @spec set_lock(key :: term()) :: boolean()
-  def set_lock(key), do: set_lock(key, nodes(), :infinity)
+  @type options :: [
+          timeout: timeout(),
+          nodes: [node()]
+        ]
 
-  @spec set_lock(key :: term(), [node()] | timeout()) :: boolean()
-  def set_lock(key, node_or_timeout)
-  def set_lock(key, [node | _] = nodes) when is_atom(node), do: set_lock(key, nodes, :infinity)
-  def set_lock(key, timeout) when is_integer(timeout), do: set_lock(key, nodes(), timeout)
-  def set_lock(key, :infinity), do: set_lock(key, nodes(), :infinity)
+  @spec lock(key :: any(), timeout() | options()) :: boolean()
+  def lock(key, timeout_or_options \\ []) do
+    options = options(timeout_or_options)
+    nodes = options[:nodes]
+    timeout = options[:timeout]
 
-  @spec set_lock(key :: term(), [node()], timeout()) :: boolean()
-  def set_lock(key, [node | _] = nodes, timeout)
-      when is_atom(node) and (is_integer(timeout) or timeout == :infinity) do
     case Utils.whereis_lock(key, nodes) do
       {on_behalf_of, {owner_pid, _lock_ref}} when on_behalf_of == self() ->
         GenServer.cast(owner_pid, :nest_lock)
@@ -25,42 +24,104 @@ defmodule FastGlobalLock do
     end
   end
 
-  @spec del_lock(key :: term()) :: boolean()
-  def del_lock(key), do: del_lock(key, nodes())
+  @spec lock!(key :: any(), timeout() | options()) :: true | no_return()
+  def lock!(key, timeout_or_options \\ []) do
+    options = options(timeout_or_options)
 
-  @spec del_lock(key :: term(), [node()]) :: boolean()
-  def del_lock(key, [node | _] = nodes) when is_atom(node) do
-    case Utils.whereis_lock(key, nodes) do
-      {on_behalf_of, {owner_pid, _lock_ref}} when on_behalf_of == self() ->
-        GenServer.call(owner_pid, :del_lock, :infinity)
-
-      _ ->
-        true
+    with false <- lock(key, options) do
+      raise FastGlobalLock.LockTimeoutError,
+        key: key,
+        nodes: options[:nodes],
+        timeout: options[:timeout]
     end
   end
 
-  @spec trans(key :: term(), (-> any())) :: any() | :aborted
-  def trans(key, fun), do: trans(key, fun, nodes(), :infinity)
+  @spec unlock(key :: any(), options()) :: :ok
+  def unlock(key, options \\ []) do
+    nodes = Keyword.get_lazy(options, :nodes, fn -> nodes() end)
 
-  @spec trans(key :: term(), (-> any()), [node()] | timeout()) :: boolean()
-  def trans(key, fun, node_or_timeout)
-  def trans(key, fun, [nod | _] = nodes) when is_atom(nod), do: trans(key, fun, nodes, :infinity)
-  def trans(key, fun, timeout) when is_integer(timeout), do: trans(key, fun, nodes(), timeout)
-  def trans(key, fun, :infinity), do: trans(key, fun, nodes(), :infinity)
+    with {on_behalf_of, {owner_pid, _lock_ref}} when on_behalf_of == self() <-
+           Utils.whereis_lock(key, nodes),
+         do: GenServer.call(owner_pid, :del_lock, :infinity)
 
-  @spec trans(key :: term(), (-> any()), [node()], timeout()) :: any() | :aborted
-  def trans(key, fun, [node | _] = nodes, timeout)
-      when is_atom(node) and (is_integer(timeout) or timeout == :infinity) do
-    if set_lock(key, nodes, timeout) do
-      try do
-        fun.()
-      after
-        del_lock(key, nodes)
-      end
-    else
-      :aborted
+    :ok
+  end
+
+  @spec with_lock!(key :: any(), timeout() | options(), (-> any())) :: any() | no_return()
+  def with_lock!(key, timeout_or_options \\ [], fun) do
+    options = options(timeout_or_options)
+
+    lock!(key, options)
+    do_with_unlock(key, options, fun)
+  end
+
+  @spec with_lock(key :: any(), timeout() | options(), (-> any())) ::
+          {:ok, any()} | {:error, :lock_timeout}
+  def with_lock(key, timeout_or_options \\ [], fun) do
+    options = options(timeout_or_options)
+
+    if lock(key, options),
+      do: {:ok, do_with_unlock(key, options, fun)},
+      else: {:error, :lock_timeout}
+  end
+
+  defp do_with_unlock(key, options, fun) do
+    fun.()
+  after
+    unlock(key, options)
+  end
+
+  defp options(timeout) when is_integer(timeout) or timeout == :infinity,
+    do: options(timeout: timeout)
+
+  defp options(options) when is_list(options) do
+    [timeout: :infinity]
+    |> Keyword.merge(options)
+    |> Keyword.put_new_lazy(:nodes, fn -> nodes() end)
+  end
+
+  # `:global`-compatible interface
+
+  @type global_id :: {resource_id :: any(), lock_requester_id :: any()}
+  @type global_retries :: :infinity | non_neg_integer()
+
+  @spec set_lock(global_id(), [node()] | nil, global_retries()) :: boolean()
+  def set_lock({key, _requester}, nodes \\ nil, retries \\ :infinity) do
+    timeout = global_retries_to_timeout(retries)
+    lock(key, nodes: nodes || nodes(), timeout: timeout)
+  end
+
+  @spec del_lock(global_id(), [node()] | nil) :: true
+  def del_lock({key, _requester}, nodes \\ nil) do
+    unlock(key, nodes: nodes || nodes())
+    true
+  end
+
+  @spec trans(global_id(), (-> any()), [node()] | nil, global_retries()) :: any() | :aborted
+  def trans({key, _requester}, fun, nodes \\ nil, retries \\ :infinity) do
+    timeout = global_retries_to_timeout(retries)
+
+    case with_lock(key, [nodes: nodes || nodes(), timeout: timeout], fun) do
+      {:ok, result} -> result
+      {:error, :lock_timeout} -> :aborted
     end
   end
 
-  defp nodes, do: Node.list([:this, :visible])
+  defp nodes,
+    do: Node.list([:this, :visible])
+
+  defp global_retries_to_timeout(retries) do
+    # Translates :global.retries() to an average millisecond timeout they correspond to.
+    # :global uses a random sleep between 0 and 1/4, 1/2, 1, 2, 4, 8, 8, 8, ... seconds, depending
+    # on which retry we're on.
+    case retries do
+      :infinity -> :infinity
+      0 -> 0
+      1 -> 125
+      2 -> 375
+      3 -> 875
+      4 -> 1875
+      x when x >= 5 -> 3875 + (x - 5) * 4000
+    end
+  end
 end
