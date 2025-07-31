@@ -7,6 +7,11 @@ defmodule FastGlobalLock.Internal.LockHolder do
   alias __MODULE__, as: State
   alias FastGlobalLock.Internal.Utils, as: Utils
 
+  @poll_interval to_timeout(second: 1)
+  @poll_jitter to_timeout(millisecond: 200)
+  @poll_min_interval to_timeout(millisecond: 10)
+  @handover_timeout to_timeout(millisecond: 100)
+
   @enforce_keys [:resource, :nodes]
   defstruct [
     :resource,
@@ -14,7 +19,6 @@ defmodule FastGlobalLock.Internal.LockHolder do
     parent: nil,
     notified_owner: nil,
     lock_count: 0,
-    times: 0,
     peers: %{},
     peer_generation: 0,
     had_lock?: false
@@ -26,7 +30,6 @@ defmodule FastGlobalLock.Internal.LockHolder do
            parent: GenServer.from() | nil,
            notified_owner: Utils.global_owner() | nil,
            lock_count: non_neg_integer(),
-           times: non_neg_integer(),
            peers: %{optional(pid()) => non_neg_integer()},
            peer_generation: non_neg_integer(),
            had_lock?: boolean()
@@ -68,7 +71,7 @@ defmodule FastGlobalLock.Internal.LockHolder do
     next_step =
       if has_lock(new_state),
         do: {:continue, {:take_over_peers, peers}},
-        else: random_sleep(new_state.times)
+        else: timeout(new_state)
 
     {:reply, :ok, new_state, next_step}
   end
@@ -141,7 +144,7 @@ defmodule FastGlobalLock.Internal.LockHolder do
 
     if has_lock(new_state),
       do: {:noreply, new_state},
-      else: {:noreply, new_state, random_sleep(new_state.times)}
+      else: {:noreply, new_state, timeout(new_state)}
   end
 
   @spec try_lock(state()) :: state()
@@ -155,7 +158,7 @@ defmodule FastGlobalLock.Internal.LockHolder do
       %{state | lock_count: state.lock_count + 1, had_lock?: true}
     else
       notified_owner = notify_lock_owner(state.resource, state.nodes, state.notified_owner)
-      new_state = %{state | notified_owner: notified_owner, times: state.times + 1}
+      new_state = %{state | notified_owner: notified_owner}
 
       if is_nil(notified_owner) do
         try_lock(new_state)
@@ -182,7 +185,7 @@ defmodule FastGlobalLock.Internal.LockHolder do
     do: :ok
 
   defp release_lock_to_first_peer([{first_peer, _peer_num} | peers]) do
-    GenServer.call(first_peer, {:peer_released_lock, Map.new(peers)}, 100)
+    GenServer.call(first_peer, {:peer_released_lock, Map.new(peers)}, @handover_timeout)
   catch
     :exit, _ -> release_lock_to_first_peer(peers)
   end
@@ -208,11 +211,7 @@ defmodule FastGlobalLock.Internal.LockHolder do
     end
   end
 
-  # Same algorithm as :global, but we can be woken up by messages
-  defp random_sleep(times) do
-    if rem(times, 10) == 0, do: :rand.seed(:exsplus)
-    # First time 1/4 seconds, then doubling each time up to 8 seconds max.
-    tmax = if times > 5, do: 8000, else: div(Bitwise.bsl(1, times) * 1000, 8)
-    :rand.uniform(tmax)
-  end
+  @spec timeout(state()) :: non_neg_integer()
+  defp timeout(_state),
+    do: max(@poll_interval + :rand.uniform(@poll_jitter) * 2 - @poll_jitter, @poll_min_interval)
 end
