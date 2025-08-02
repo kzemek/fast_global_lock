@@ -169,7 +169,7 @@ defmodule FastGlobalLock.Internal.LockHolder do
   end
 
   defp release_lock_to_first_peer(%Peers{} = peers) do
-    case Peers.pop_smallest_delay_maintain(peers) do
+    case Peers.pop_delaymaintain(peers) do
       :empty ->
         :ok
 
