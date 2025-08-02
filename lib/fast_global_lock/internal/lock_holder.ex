@@ -71,7 +71,17 @@ defmodule FastGlobalLock.Internal.LockHolder do
         do: {:continue, {:take_over_peers, peers}},
         else: timeout(new_state)
 
-    {:reply, :ok, new_state, next_step}
+    {:reply, has_lock(new_state), new_state, next_step}
+  end
+
+  def handle_call({:peer_awaiting_lock, peer}, _from, %State{} = state) do
+    if Peers.contains?(state.peers, peer) do
+      {:reply, :ok, state}
+    else
+      Process.monitor(peer)
+      peers = Peers.add(state.peers, peer)
+      {:reply, :ok, %{state | peers: peers}}
+    end
   end
 
   @impl GenServer
@@ -101,16 +111,6 @@ defmodule FastGlobalLock.Internal.LockHolder do
   def handle_cast(:nest_lock, %State{} = state) do
     Logger.error("FastGlobalLock: nest_lock called on unlocked state")
     {:stop, :nest_lock_on_unlocked_state, state}
-  end
-
-  def handle_cast({:peer_awaiting_lock, peer}, %State{} = state) do
-    if Peers.contains?(state.peers, peer) do
-      {:noreply, state}
-    else
-      Process.monitor(peer)
-      peers = Peers.add(state.peers, peer)
-      {:noreply, %{state | peers: peers}}
-    end
   end
 
   @impl GenServer
@@ -161,17 +161,11 @@ defmodule FastGlobalLock.Internal.LockHolder do
       notified_owner = notify_lock_owner(state.resource, state.nodes, state.notified_owner)
       new_state = %{state | notified_owner: notified_owner}
 
-      if is_nil(notified_owner) do
-        try_lock(new_state)
-      else
-        if notified_owner != state.notified_owner, do: monitor_owner(notified_owner)
-        new_state
-      end
+      if is_nil(notified_owner),
+        do: try_lock(new_state),
+        else: new_state
     end
   end
-
-  defp monitor_owner({pid, _lock_ref}),
-    do: Process.monitor(pid)
 
   @spec del_global_lock(state()) :: state()
   defp del_global_lock(%State{parent: {parent_pid, _tag}} = state) when has_lock(state) do
@@ -186,7 +180,11 @@ defmodule FastGlobalLock.Internal.LockHolder do
 
       {peer, next_peers} ->
         try do
-          GenServer.call(peer, {:peer_released_lock, next_peers}, @handover_timeout)
+          if not GenServer.call(peer, {:peer_released_lock, next_peers}, @handover_timeout) do
+            for peer <- Peers.as_unordered_enumerable(next_peers),
+                not Peers.contains?(peers, peer),
+                do: send(peer, :timeout)
+          end
         catch
           :exit, _ -> release_lock_to_first_peer(next_peers)
         end
@@ -197,20 +195,20 @@ defmodule FastGlobalLock.Internal.LockHolder do
           Utils.global_owner() | nil
   defp notify_lock_owner(resource, nodes, previously_notified_owner) do
     case Utils.whereis_lock(resource, nodes) do
-      nil -> nil
-      {_on_behalf_of, ^previously_notified_owner} -> previously_notified_owner
-      {_on_behalf_of, new_owner} -> do_notify_lock_owner(resource, nodes, new_owner)
-    end
-  end
+      nil ->
+        nil
 
-  defp do_notify_lock_owner(resource, nodes, {owner_pid, _lock_ref} = owner) do
-    GenServer.cast(owner_pid, {:peer_awaiting_lock, self()})
+      {_on_behalf_of, ^previously_notified_owner} ->
+        previously_notified_owner
 
-    # the owner may have changed from under us while we were notifying it
-    case Utils.whereis_lock(resource, nodes) do
-      nil -> nil
-      {_on_behalf_of, ^owner} -> owner
-      {_on_behalf_of, new_owner} -> do_notify_lock_owner(resource, nodes, new_owner)
+      {_on_behalf_of, {new_owner_pid, _} = new_owner} ->
+        try do
+          GenServer.call(new_owner_pid, {:peer_awaiting_lock, self()}, @handover_timeout)
+          new_owner
+        catch
+          :exit, _ ->
+            notify_lock_owner(resource, nodes, new_owner)
+        end
     end
   end
 
