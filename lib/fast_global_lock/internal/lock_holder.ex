@@ -5,7 +5,7 @@ defmodule FastGlobalLock.Internal.LockHolder do
   require Logger
 
   alias __MODULE__, as: State
-  alias FastGlobalLock.Internal.Utils, as: Utils
+  alias FastGlobalLock.Internal.{Peers, Utils}
 
   @poll_interval to_timeout(second: 1)
   @poll_jitter to_timeout(millisecond: 200)
@@ -19,8 +19,7 @@ defmodule FastGlobalLock.Internal.LockHolder do
     parent: nil,
     notified_owner: nil,
     lock_count: 0,
-    peers: %{},
-    peer_generation: 0,
+    peers: Peers.new(),
     had_lock?: false
   ]
 
@@ -30,8 +29,7 @@ defmodule FastGlobalLock.Internal.LockHolder do
            parent: GenServer.from() | nil,
            notified_owner: Utils.global_owner() | nil,
            lock_count: non_neg_integer(),
-           peers: %{optional(pid()) => non_neg_integer()},
-           peer_generation: non_neg_integer(),
+           peers: Peers.t(),
            had_lock?: boolean()
          }
 
@@ -49,7 +47,7 @@ defmodule FastGlobalLock.Internal.LockHolder do
 
   def handle_call({:set_lock, timeout}, parent, %State{} = state) do
     if timeout != :infinity, do: :erlang.send_after(timeout, self(), :lock_timeout)
-    noreply_try_lock(%{state | parent: parent})
+    {:noreply, %{state | parent: parent}, 0}
   end
 
   def handle_call(:del_lock, _from, %State{lock_count: 1} = state) do
@@ -78,14 +76,19 @@ defmodule FastGlobalLock.Internal.LockHolder do
 
   @impl GenServer
   def handle_continue({:take_over_peers, peers}, %State{} = state) do
-    # There's an edge case where this process aquired the lock before receiving
-    # `:peer_released_lock` message. In this case, we can't tell the ordering between the current
-    # peers and the received peers, so we just merge them and allow duplicate generations
-    peers = Map.merge(peers, state.peers)
+    # There's an edge case where this holder took a lock before being notified by the previous
+    # owner. In that case, we might have some peers already, but there shouldn't be many.
+    for peer <- Peers.as_unordered_enumerable(peers),
+        not Peers.contains?(state.peers, peer),
+        do: Process.monitor(peer)
 
-    peer_generation = Enum.max([-1 | Map.values(peers)]) + 1
-    Enum.each(Map.keys(peers), &Process.monitor/1)
-    {:noreply, %{state | peers: peers, peer_generation: peer_generation}}
+    merged_peers =
+      state.peers
+      |> Peers.to_list()
+      |> Enum.reduce(peers, &Peers.add(&2, &1))
+      |> Peers.maintain()
+
+    {:noreply, %{state | peers: merged_peers}}
   end
 
   def handle_continue(:stop, %State{} = state),
@@ -100,15 +103,14 @@ defmodule FastGlobalLock.Internal.LockHolder do
     {:stop, :nest_lock_on_unlocked_state, state}
   end
 
-  def handle_cast({:peer_awaiting_lock, peer}, %State{} = state)
-      when is_map_key(state.peers, peer),
-      do: {:noreply, state}
-
   def handle_cast({:peer_awaiting_lock, peer}, %State{} = state) do
-    Process.monitor(peer)
-    peer_num = state.peer_generation
-    peers = Map.put(state.peers, peer, peer_num)
-    {:noreply, %{state | peers: peers, peer_generation: peer_num + 1}}
+    if Peers.contains?(state.peers, peer) do
+      {:noreply, state}
+    else
+      Process.monitor(peer)
+      peers = Peers.add(state.peers, peer)
+      {:noreply, %{state | peers: peers}}
+    end
   end
 
   @impl GenServer
@@ -120,14 +122,21 @@ defmodule FastGlobalLock.Internal.LockHolder do
     {:stop, :normal, state}
   end
 
-  def handle_info(:timeout, %State{} = state),
-    do: noreply_try_lock(state)
+  def handle_info(:timeout, %State{} = state) do
+    new_state = try_lock(state)
 
-  def handle_info({:DOWN, _ref, :process, pid, _reason}, %State{} = state) when has_lock(state),
-    do: {:noreply, %{state | peers: Map.delete(state.peers, pid)}}
+    if has_lock(new_state),
+      do: {:noreply, new_state},
+      else: {:noreply, new_state, timeout(new_state)}
+  end
+
+  def handle_info({:DOWN, _, :process, peer, _reason}, %State{} = state) when has_lock(state) do
+    peers = Peers.remove(state.peers, peer)
+    {:noreply, %{state | peers: peers}}
+  end
 
   def handle_info({:DOWN, _ref, :process, _pid, _reason}, %State{} = state),
-    do: noreply_try_lock(state)
+    do: {:noreply, state, 0}
 
   def handle_info({ref, _late_genserver_reply}, %State{} = state) when is_reference(ref),
     do: {:noreply, state}
@@ -137,14 +146,6 @@ defmodule FastGlobalLock.Internal.LockHolder do
     if has_lock(state), do: del_global_lock(state)
     if state.had_lock?, do: release_lock_to_first_peer(state.peers)
     :ok
-  end
-
-  defp noreply_try_lock(state) do
-    new_state = try_lock(state)
-
-    if has_lock(new_state),
-      do: {:noreply, new_state},
-      else: {:noreply, new_state, timeout(new_state)}
   end
 
   @spec try_lock(state()) :: state()
@@ -178,16 +179,18 @@ defmodule FastGlobalLock.Internal.LockHolder do
     %{state | lock_count: 0}
   end
 
-  defp release_lock_to_first_peer(peers) when is_map(peers),
-    do: peers |> Enum.sort_by(fn {_peer, num} -> num end) |> release_lock_to_first_peer()
+  defp release_lock_to_first_peer(%Peers{} = peers) do
+    case Peers.pop_smallest_delay_maintain(peers) do
+      :empty ->
+        :ok
 
-  defp release_lock_to_first_peer([]),
-    do: :ok
-
-  defp release_lock_to_first_peer([{first_peer, _peer_num} | peers]) do
-    GenServer.call(first_peer, {:peer_released_lock, Map.new(peers)}, @handover_timeout)
-  catch
-    :exit, _ -> release_lock_to_first_peer(peers)
+      {peer, next_peers} ->
+        try do
+          GenServer.call(peer, {:peer_released_lock, next_peers}, @handover_timeout)
+        catch
+          :exit, _ -> release_lock_to_first_peer(next_peers)
+        end
+    end
   end
 
   @spec notify_lock_owner(term(), [node()], Utils.global_owner() | nil) ::
