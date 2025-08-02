@@ -74,29 +74,24 @@ defmodule FastGlobalLock.Internal.LockHolder do
     {:reply, has_lock(new_state), new_state, next_step}
   end
 
-  def handle_call({:peer_awaiting_lock, peer}, _from, %State{} = state) do
-    if Peers.contains?(state.peers, peer) do
-      {:reply, :ok, state}
-    else
-      Process.monitor(peer)
-      peers = Peers.add(state.peers, peer)
-      {:reply, :ok, %{state | peers: peers}}
-    end
-  end
+  def handle_call({:peer_awaiting_lock, peer}, _from, %State{} = state),
+    do: {:reply, :ok, %{state | peers: Peers.add(state.peers, peer)}}
 
   @impl GenServer
   def handle_continue({:take_over_peers, peers}, %State{} = state) do
     # There's an edge case where this holder took a lock before being notified by the previous
     # owner. In that case, we might have some peers already, but there shouldn't be many.
-    for peer <- Peers.as_unordered_enumerable(peers),
-        not Peers.contains?(state.peers, peer),
-        do: Process.monitor(peer)
 
     merged_peers =
       state.peers
       |> Peers.to_list()
       |> Enum.reduce(peers, &Peers.add(&2, &1))
       |> Peers.maintain()
+
+    # We can leave any previous monitors in place, they don't break the logic.
+    for peer <- Peers.monitored(merged_peers),
+        peer not in Peers.monitored(state.peers),
+        do: Process.monitor(peer)
 
     {:noreply, %{state | peers: merged_peers}}
   end
