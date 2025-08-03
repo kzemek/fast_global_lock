@@ -119,6 +119,17 @@ defmodule FastGlobalLockTest do
       assert :ok = FastGlobalLock.unlock(key)
       assert true = in_new_process(fn -> FastGlobalLock.lock(key, 0) end)
     end
+
+    test "nest?: false does not increment lock count" do
+      key = make_ref()
+
+      assert true = FastGlobalLock.lock(key, nest?: false)
+      assert true = FastGlobalLock.lock(key, nest?: false)
+
+      assert :ok = FastGlobalLock.unlock(key)
+
+      assert true = in_new_process(fn -> FastGlobalLock.lock(key, 0) end)
+    end
   end
 
   describe "with_lock functions" do
@@ -223,6 +234,34 @@ defmodule FastGlobalLockTest do
       assert true = FastGlobalLock.del_lock(global_id)
     end
 
+    test "lock requester ID is ignored" do
+      key = make_ref()
+      global_id1 = {key, :requester1}
+      global_id2 = {key, :requester2}
+
+      assert true = FastGlobalLock.set_lock(global_id1)
+      refute in_new_process(fn -> FastGlobalLock.set_lock(global_id2, [node()], 0) end)
+
+      # We can delete using the other global id
+      assert true = FastGlobalLock.del_lock(global_id2)
+      assert true = in_new_process(fn -> FastGlobalLock.set_lock(global_id2, [node()], 0) end)
+    end
+
+    test "del_lock fully unlocks regardless of nesting level" do
+      key = make_ref()
+      global_id = {key, self()}
+
+      assert true = FastGlobalLock.lock(key)
+      assert true = FastGlobalLock.lock(key)
+      assert true = FastGlobalLock.lock(key)
+
+      refute in_new_process(fn -> FastGlobalLock.lock(key, 0) end)
+
+      assert true = FastGlobalLock.del_lock(global_id)
+
+      assert true = in_new_process(fn -> FastGlobalLock.lock(key, 0) end)
+    end
+
     test "set_lock with retries" do
       key = make_ref()
       global_id = {key, self()}
@@ -231,17 +270,17 @@ defmodule FastGlobalLockTest do
 
       # Should fail with 0 retries
       {us, _} =
-        :timer.tc(fn -> refute FastGlobalLock.set_lock(global_id, nil, 0) end, :microsecond)
+        :timer.tc(fn -> refute FastGlobalLock.set_lock(global_id, [node()], 0) end, :microsecond)
 
       assert us < 1000
 
       {us, _} =
-        :timer.tc(fn -> FastGlobalLock.set_lock(global_id, nil, 1) end, :millisecond)
+        :timer.tc(fn -> FastGlobalLock.set_lock(global_id, [node()], 1) end, :millisecond)
 
       assert us in 125..374
 
       {us, _} =
-        :timer.tc(fn -> FastGlobalLock.set_lock(global_id, nil, 2) end, :millisecond)
+        :timer.tc(fn -> FastGlobalLock.set_lock(global_id, [node()], 2) end, :millisecond)
 
       assert us in 375..874
     end
@@ -262,6 +301,22 @@ defmodule FastGlobalLockTest do
 
       assert :aborted =
                FastGlobalLock.trans(global_id, fn -> :should_not_reach end, nil, 0)
+    end
+
+    test "trans function only decrements lock count by one" do
+      key = make_ref()
+      global_id = {key, self()}
+
+      assert true = FastGlobalLock.lock(key)
+      assert true = FastGlobalLock.lock(key)
+
+      assert :trans_result = FastGlobalLock.trans(global_id, fn -> :trans_result end)
+
+      refute in_new_process(fn -> FastGlobalLock.lock(key, 0) end)
+
+      # After `trans`, we still have one lock left
+      assert :ok = FastGlobalLock.unlock(key)
+      assert {:error, _} = FastGlobalLock.unlock(key)
     end
   end
 

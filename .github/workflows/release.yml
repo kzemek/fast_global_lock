@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  release:
+    types: [created]
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  ELIXIR_VERSION: "1.18.4"
+  ERLANG_VERSION: "27.3.4"
+
+jobs:
+  build:
+    name: Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+
+      - name: Set up Elixir
+        uses: erlef/setup-beam@8e7fdef09ffa3ea54328b5000c170a3b9b20ca96 # v1.20.3
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.ERLANG_VERSION }}
+
+      - name: Get deps
+        run: mix deps.get
+
+      - id: set-version
+        name: Set version variable
+        run: |
+          VSN="${{ github.event.release.tag_name }}"
+          VSN="${VSN#v}"
+          echo "version=${VSN}" >> $GITHUB_OUTPUT
+
+      - name: Update version in mix.exs and README.md
+        run: |
+          sed -i 's/version: ".*"/version: "${{ steps.set-version.outputs.version }}"/' mix.exs
+          sed -i 's/:fast_global_lock, "~> .*"/:fast_global_lock, "~> ${{ steps.set-version.outputs.version }}"/' README.md
+          git config --global user.name 'Konrad Zemek'
+          git config --global user.email 'kzemek@users.noreply.github.com'
+          git add mix.exs README.md
+          git commit -m "Release ${{ github.event.release.tag_name }}"
+          git push
+
+      - name: Retag release
+        run: |
+          git tag -f ${{ github.event.release.tag_name }} HEAD
+          git push -f origin ${{ github.event.release.tag_name }}
+
+      - name: Release to hex.pm
+        run: mix hex.publish --yes
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}

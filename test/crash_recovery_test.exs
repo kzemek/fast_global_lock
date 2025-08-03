@@ -2,6 +2,7 @@ defmodule FastGlobalLock.CrashRecoveryTest do
   use ExUnit.Case, async: true
 
   alias FastGlobalLock
+  alias FastGlobalLock.Internal.Utils
 
   describe "crash recovery" do
     test "lock is released when locking process dies" do
@@ -28,7 +29,7 @@ defmodule FastGlobalLock.CrashRecoveryTest do
       # Can't acquire a lock that's already held
       refute FastGlobalLock.lock(key, 0)
 
-      {^pid, {holder_pid, _}} = FastGlobalLock.Internal.Utils.whereis_lock(key, [node()])
+      {^pid, {holder_pid, _}} = Utils.whereis_lock(key, [node()])
 
       Process.exit(holder_pid, :kill)
 
