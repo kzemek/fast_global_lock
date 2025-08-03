@@ -36,19 +36,26 @@ defmodule FastGlobalLock.Internal.LockHolder do
   defguardp has_lock(state) when state.lock_count > 0
 
   @impl GenServer
-  def init({resource, nodes}),
-    do: {:ok, %State{resource: resource, nodes: nodes}}
+  def init({resource, nodes, parent_pid, 0 = _timeout}) do
+    case try_lock_once(%State{resource: resource, nodes: nodes, parent: {parent_pid, nil}}) do
+      locked_state when has_lock(locked_state) -> {:ok, locked_state}
+      _ -> :ignore
+    end
+  end
+
+  def init({resource, nodes, _parent_pid, timeout}) do
+    if timeout != :infinity, do: :erlang.send_after(timeout, self(), :lock_timeout)
+    {:ok, %State{resource: resource, nodes: nodes}}
+  end
 
   @impl GenServer
-  def handle_call({:set_lock, _timeout}, _parent, %State{} = state) when has_lock(state) do
+  def handle_call(:set_lock, _parent, %State{} = state) when has_lock(state) do
     Logger.warning("FastGlobalLock: set_lock called on locked state")
     {:reply, true, %{state | lock_count: state.lock_count + 1}}
   end
 
-  def handle_call({:set_lock, timeout}, parent, %State{} = state) do
-    if timeout != :infinity, do: :erlang.send_after(timeout, self(), :lock_timeout)
-    {:noreply, %{state | parent: parent}, 0}
-  end
+  def handle_call(:set_lock, parent, %State{} = state),
+    do: {:noreply, %{state | parent: parent}, 0}
 
   def handle_call(:del_lock, _from, %State{lock_count: 1} = state) do
     new_state = del_global_lock(state)
@@ -146,18 +153,28 @@ defmodule FastGlobalLock.Internal.LockHolder do
   defp try_lock(%State{} = state) when has_lock(state),
     do: state
 
-  defp try_lock(%State{parent: {parent_pid, _tag}} = state) do
+  defp try_lock(%State{} = state) do
+    case try_lock_once(state) do
+      locked_state when has_lock(locked_state) ->
+        GenServer.reply(state.parent, true)
+        locked_state
+
+      state ->
+        notified_owner = notify_lock_owner(state.resource, state.nodes, state.notified_owner)
+        new_state = %{state | notified_owner: notified_owner}
+
+        if is_nil(notified_owner),
+          do: try_lock(new_state),
+          else: new_state
+    end
+  end
+
+  defp try_lock_once(%State{parent: {parent_pid, _tag}} = state) do
     if :global.set_lock({state.resource, parent_pid}, state.nodes, 0) do
       Process.flag(:trap_exit, true)
-      GenServer.reply(state.parent, true)
       %{state | lock_count: state.lock_count + 1, had_lock?: true}
     else
-      notified_owner = notify_lock_owner(state.resource, state.nodes, state.notified_owner)
-      new_state = %{state | notified_owner: notified_owner}
-
-      if is_nil(notified_owner),
-        do: try_lock(new_state),
-        else: new_state
+      state
     end
   end
 

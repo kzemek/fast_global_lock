@@ -18,9 +18,15 @@ defmodule FastGlobalLock do
         GenServer.cast(owner_pid, :nest_lock)
         true
 
+      _ when timeout == 0 ->
+        case GenServer.start_link(LockHolder, {key, nodes, self(), 0}) do
+          {:ok, _lock_holder} -> true
+          :ignore -> false
+        end
+
       _ ->
-        {:ok, lock_holder} = GenServer.start_link(LockHolder, {key, nodes})
-        GenServer.call(lock_holder, {:set_lock, timeout}, :infinity)
+        {:ok, lock_holder} = GenServer.start_link(LockHolder, {key, nodes, self(), timeout})
+        GenServer.call(lock_holder, :set_lock, :infinity)
     end
   end
 
