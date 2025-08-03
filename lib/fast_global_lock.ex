@@ -36,15 +36,17 @@ defmodule FastGlobalLock do
     end
   end
 
-  @spec unlock(key :: any(), options()) :: :ok
+  @spec unlock(key :: any(), options()) :: :ok | {:error, :not_owner | :not_locked}
   def unlock(key, options \\ []) do
     nodes = Keyword.get_lazy(options, :nodes, fn -> nodes() end)
 
-    with {on_behalf_of, {owner_pid, _lock_ref}} when on_behalf_of == self() <-
-           Utils.whereis_lock(key, nodes),
-         do: GenServer.call(owner_pid, :del_lock, :infinity)
+    self = self()
 
-    :ok
+    case Utils.whereis_lock(key, nodes) do
+      {^self, {owner_pid, _lock_ref}} -> GenServer.call(owner_pid, :del_lock, :infinity)
+      {_on_behalf_of, _owner} -> {:error, :not_owner}
+      nil -> {:error, :not_locked}
+    end
   end
 
   @spec with_lock!(key :: any(), timeout() | options(), (-> any())) :: any() | no_return()
@@ -93,7 +95,9 @@ defmodule FastGlobalLock do
 
   @spec del_lock(global_id(), [node()] | nil) :: true
   def del_lock({key, _requester}, nodes \\ nil) do
-    unlock(key, nodes: nodes || nodes())
+    Stream.repeatedly(fn -> unlock(key, nodes: nodes) end)
+    |> Enum.take_while(&(&1 == :ok))
+
     true
   end
 

@@ -52,11 +52,11 @@ defmodule FastGlobalLock.Internal.LockHolder do
 
   def handle_call(:del_lock, _from, %State{lock_count: 1} = state) do
     new_state = del_global_lock(state)
-    {:reply, true, new_state, {:continue, :stop}}
+    {:reply, :ok, new_state, {:continue, :stop}}
   end
 
   def handle_call(:del_lock, _from, %State{} = state) when has_lock(state),
-    do: {:reply, true, %{state | lock_count: state.lock_count - 1}}
+    do: {:reply, :ok, %{state | lock_count: state.lock_count - 1}}
 
   def handle_call(:del_lock, _from, %State{} = state) do
     Logger.error("FastGlobalLock: del_lock called on unlocked state")
@@ -118,11 +118,10 @@ defmodule FastGlobalLock.Internal.LockHolder do
   end
 
   def handle_info(:timeout, %State{} = state) do
-    new_state = try_lock(state)
-
-    if has_lock(new_state),
-      do: {:noreply, new_state},
-      else: {:noreply, new_state, timeout(new_state)}
+    case try_lock(state) do
+      locked_state when has_lock(locked_state) -> {:noreply, locked_state}
+      new_state -> {:noreply, new_state, timeout(new_state)}
+    end
   end
 
   def handle_info({:DOWN, _, :process, peer, _reason}, %State{} = state) when has_lock(state) do
