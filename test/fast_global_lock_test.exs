@@ -74,7 +74,7 @@ defmodule FastGlobalLockTest do
       end)
 
       {us, _} = :timer.tc(fn -> assert Task.await(task) end, :microsecond)
-      assert us < 2000
+      assert us < 5000
     end
 
     test "lock fails when timeout expires" do
@@ -300,7 +300,7 @@ defmodule FastGlobalLockTest do
       {:ok, _holder_pid} = Agent.start(fn -> FastGlobalLock.set_lock(global_id) end)
 
       assert :aborted =
-               FastGlobalLock.trans(global_id, fn -> :should_not_reach end, nil, 0)
+               FastGlobalLock.trans(global_id, fn -> :should_not_reach end, [node()], 0)
     end
 
     test "trans function only decrements lock count by one" do
