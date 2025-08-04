@@ -5,7 +5,7 @@ defmodule FastGlobalLock.Internal.LockHolder do
   require Logger
 
   alias __MODULE__, as: State
-  alias FastGlobalLock.Internal.{Peers, Utils}
+  alias FastGlobalLock.Internal.Peers
 
   @poll_interval to_timeout(second: 1)
   @poll_jitter to_timeout(millisecond: 200)
@@ -18,8 +18,8 @@ defmodule FastGlobalLock.Internal.LockHolder do
     :nodes,
     parent: nil,
     notified_owner: nil,
-    lock_count: 0,
     peers: Peers.new(),
+    has_lock?: false,
     had_lock?: false
   ]
 
@@ -27,18 +27,16 @@ defmodule FastGlobalLock.Internal.LockHolder do
            resource: term(),
            nodes: [node()],
            parent: GenServer.from() | nil,
-           notified_owner: Utils.global_owner() | nil,
-           lock_count: non_neg_integer(),
+           notified_owner: pid() | nil,
            peers: Peers.t(),
-           had_lock?: boolean()
+           had_lock?: boolean(),
+           has_lock?: boolean()
          }
-
-  defguardp has_lock(state) when state.lock_count > 0
 
   @impl GenServer
   def init({resource, nodes, parent_pid, 0 = _timeout}) do
     case try_lock_once(%State{resource: resource, nodes: nodes, parent: {parent_pid, nil}}) do
-      locked_state when has_lock(locked_state) -> {:ok, locked_state}
+      %State{has_lock?: true} = locked_state -> {:ok, locked_state}
       _ -> :ignore
     end
   end
@@ -49,40 +47,39 @@ defmodule FastGlobalLock.Internal.LockHolder do
   end
 
   @impl GenServer
-  def handle_call(:set_lock, _parent, %State{} = state) when has_lock(state) do
-    Logger.warning("FastGlobalLock: set_lock called on locked state")
-    {:reply, true, %{state | lock_count: state.lock_count + 1}}
+  def handle_call(:set_lock, _parent, %State{has_lock?: true} = state) do
+    Logger.warning("set_lock called on locked state")
+    {:reply, true, state}
   end
 
   def handle_call(:set_lock, parent, %State{} = state),
     do: {:noreply, %{state | parent: parent}, 0}
 
-  def handle_call(:del_lock, _from, %State{lock_count: 1} = state) do
+  def handle_call(:del_lock, _from, %State{has_lock?: true} = state) do
     new_state = del_global_lock(state)
     {:reply, :ok, new_state, {:continue, :stop}}
   end
 
-  def handle_call(:del_lock, _from, %State{} = state) when has_lock(state),
-    do: {:reply, :ok, %{state | lock_count: state.lock_count - 1}}
-
   def handle_call(:del_lock, _from, %State{} = state) do
-    Logger.error("FastGlobalLock: del_lock called on unlocked state")
+    Logger.error("del_lock called on unlocked state")
     {:stop, :del_lock_on_unlocked_state, state}
   end
 
   def handle_call({:peer_released_lock, peers}, _from, %State{} = state) do
-    new_state = try_lock(state)
+    case try_lock(state) do
+      %State{has_lock?: true} = locked_state ->
+        {:reply, true, locked_state, {:continue, {:take_over_peers, peers}}}
 
-    next_step =
-      if has_lock(new_state),
-        do: {:continue, {:take_over_peers, peers}},
-        else: timeout(new_state)
-
-    {:reply, has_lock(new_state), new_state, next_step}
+      %State{} = state ->
+        {:reply, false, state, timeout(state)}
+    end
   end
 
-  def handle_call({:peer_awaiting_lock, peer}, _from, %State{} = state),
-    do: {:reply, :ok, %{state | peers: Peers.add(state.peers, peer)}}
+  def handle_call({:peer_awaiting_lock, peer}, _from, %State{had_lock?: true} = state),
+    do: {:reply, true, %{state | peers: Peers.add(state.peers, peer)}}
+
+  def handle_call({:peer_awaiting_lock, _peer}, _from, %State{} = state),
+    do: {:reply, false, state, timeout(state)}
 
   @impl GenServer
   def handle_continue({:take_over_peers, peers}, %State{} = state) do
@@ -107,16 +104,7 @@ defmodule FastGlobalLock.Internal.LockHolder do
     do: {:stop, :normal, state}
 
   @impl GenServer
-  def handle_cast(:nest_lock, %State{} = state) when has_lock(state),
-    do: {:noreply, %{state | lock_count: state.lock_count + 1}}
-
-  def handle_cast(:nest_lock, %State{} = state) do
-    Logger.error("FastGlobalLock: nest_lock called on unlocked state")
-    {:stop, :nest_lock_on_unlocked_state, state}
-  end
-
-  @impl GenServer
-  def handle_info(:lock_timeout, %State{} = state) when has_lock(state),
+  def handle_info(:lock_timeout, %State{has_lock?: true} = state),
     do: {:noreply, state}
 
   def handle_info(:lock_timeout, %State{} = state) do
@@ -126,12 +114,12 @@ defmodule FastGlobalLock.Internal.LockHolder do
 
   def handle_info(:timeout, %State{} = state) do
     case try_lock(state) do
-      locked_state when has_lock(locked_state) -> {:noreply, locked_state}
-      new_state -> {:noreply, new_state, timeout(new_state)}
+      %State{has_lock?: true} = locked_state -> {:noreply, locked_state}
+      %State{} = state -> {:noreply, state, timeout(state)}
     end
   end
 
-  def handle_info({:DOWN, _, :process, peer, _reason}, %State{} = state) when has_lock(state) do
+  def handle_info({:DOWN, _, :process, peer, _reason}, %State{has_lock?: true} = state) do
     peers = Peers.remove(state.peers, peer)
     {:noreply, %{state | peers: peers}}
   end
@@ -140,48 +128,44 @@ defmodule FastGlobalLock.Internal.LockHolder do
     do: {:noreply, state, 0}
 
   def handle_info({ref, _late_genserver_reply}, %State{} = state) when is_reference(ref),
-    do: {:noreply, state}
+    do: if(state.has_lock?, do: {:noreply, state}, else: {:noreply, state, 0})
 
   @impl GenServer
   def terminate(_reason, %State{} = state) do
-    if has_lock(state), do: del_global_lock(state)
+    if state.has_lock?, do: del_global_lock(state)
     if state.had_lock?, do: release_lock_to_first_peer(state.peers)
     :ok
   end
 
   @spec try_lock(state()) :: state()
-  defp try_lock(%State{} = state) when has_lock(state),
+  defp try_lock(%State{has_lock?: true} = state),
     do: state
 
   defp try_lock(%State{} = state) do
     case try_lock_once(state) do
-      locked_state when has_lock(locked_state) ->
+      %State{has_lock?: true} = locked_state ->
         GenServer.reply(state.parent, true)
         locked_state
 
-      state ->
-        notified_owner = notify_lock_owner(state.resource, state.nodes, state.notified_owner)
-        new_state = %{state | notified_owner: notified_owner}
-
-        if is_nil(notified_owner),
-          do: try_lock(new_state),
-          else: new_state
+      %State{} = state ->
+        {lock_found?, state} = notify_lock_owner(state)
+        if lock_found?, do: state, else: try_lock(state)
     end
   end
 
   defp try_lock_once(%State{parent: {parent_pid, _tag}} = state) do
     if :global.set_lock({state.resource, parent_pid}, state.nodes, 0) do
       Process.flag(:trap_exit, true)
-      %{state | lock_count: state.lock_count + 1, had_lock?: true}
+      %{state | has_lock?: true, had_lock?: true}
     else
       state
     end
   end
 
   @spec del_global_lock(state()) :: state()
-  defp del_global_lock(%State{parent: {parent_pid, _tag}} = state) when has_lock(state) do
+  defp del_global_lock(%State{parent: {parent_pid, _tag}, has_lock?: true} = state) do
     :global.del_lock({state.resource, parent_pid}, state.nodes)
-    %{state | lock_count: 0}
+    %{state | has_lock?: false}
   end
 
   defp release_lock_to_first_peer(%Peers{} = peers) do
@@ -202,23 +186,26 @@ defmodule FastGlobalLock.Internal.LockHolder do
     end
   end
 
-  @spec notify_lock_owner(term(), [node()], Utils.global_owner() | nil) ::
-          Utils.global_owner() | nil
-  defp notify_lock_owner(resource, nodes, previously_notified_owner) do
-    case Utils.whereis_lock(resource, nodes) do
+  @spec notify_lock_owner(state()) :: {boolean(), state()}
+  defp notify_lock_owner(%State{} = state) do
+    previously_notified_owner = state.notified_owner
+
+    case whereis_lock(state.resource, state.nodes) do
       nil ->
-        nil
+        # That we didn't find the lock doesn't mean it's not there (we might have checked a wrong
+        # node), so don't change `notified_owner` in this state
+        {false, state}
 
-      {_on_behalf_of, ^previously_notified_owner} ->
-        previously_notified_owner
+      ^previously_notified_owner ->
+        {true, state}
 
-      {_on_behalf_of, {new_owner_pid, _} = new_owner} ->
+      new_owner ->
         try do
-          GenServer.call(new_owner_pid, {:peer_awaiting_lock, self()}, @handover_timeout)
-          new_owner
+          if GenServer.call(new_owner, {:peer_awaiting_lock, self()}, @handover_timeout),
+            do: {true, %{state | notified_owner: new_owner}},
+            else: notify_lock_owner(state)
         catch
-          :exit, _ ->
-            notify_lock_owner(resource, nodes, new_owner)
+          :exit, _ -> notify_lock_owner(state)
         end
     end
   end
@@ -226,4 +213,18 @@ defmodule FastGlobalLock.Internal.LockHolder do
   @spec timeout(state()) :: non_neg_integer()
   defp timeout(_state),
     do: max(@poll_interval + :rand.uniform(@poll_jitter) * 2 - @poll_jitter, @poll_min_interval)
+
+  @spec whereis_lock(any(), [node()]) :: pid() | nil
+  defp whereis_lock(resource, nodes) do
+    node = Enum.random(nodes)
+
+    case :erpc.call(node, :ets, :lookup, [:global_locks, resource]) do
+      # while the lock is unlocked, the `:global_locks` entry can contain a process that tried and
+      # failed to acquire it
+      [{_resource, _on_behalf_of, [{owner, _}]}] when owner != self() -> owner
+      _ -> nil
+    end
+  catch
+    _, _ -> nil
+  end
 end

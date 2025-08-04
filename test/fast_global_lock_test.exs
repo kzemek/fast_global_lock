@@ -8,7 +8,7 @@ defmodule FastGlobalLockTest do
       key = make_ref()
 
       assert true = FastGlobalLock.lock(key)
-      assert :ok = FastGlobalLock.unlock(key)
+      assert true = FastGlobalLock.unlock(key)
     end
 
     test "second process cannot acquire held lock" do
@@ -18,14 +18,14 @@ defmodule FastGlobalLockTest do
 
       refute in_new_process(fn -> FastGlobalLock.lock(key, 0) end)
 
-      assert :ok = FastGlobalLock.unlock(key)
+      assert true = FastGlobalLock.unlock(key)
     end
 
     test "second process can acquire lock after release" do
       key = make_ref()
 
       assert true = FastGlobalLock.lock(key)
-      assert :ok = FastGlobalLock.unlock(key)
+      assert true = FastGlobalLock.unlock(key)
 
       assert true = in_new_process(fn -> FastGlobalLock.lock(key, 0) end)
     end
@@ -94,11 +94,11 @@ defmodule FastGlobalLockTest do
       assert true = FastGlobalLock.lock(key)
       assert true = FastGlobalLock.lock(key)
 
-      assert :ok = FastGlobalLock.unlock(key)
-      assert :ok = FastGlobalLock.unlock(key)
-      assert :ok = FastGlobalLock.unlock(key)
+      assert true = FastGlobalLock.unlock(key)
+      assert true = FastGlobalLock.unlock(key)
+      assert true = FastGlobalLock.unlock(key)
 
-      assert {:error, :not_locked} = FastGlobalLock.unlock(key)
+      refute FastGlobalLock.unlock(key)
     end
 
     test "other processes cannot acquire lock while any nests remain" do
@@ -112,22 +112,11 @@ defmodule FastGlobalLockTest do
       refute in_new_process(fn -> FastGlobalLock.lock(key, 0) end)
 
       # Unlock once - other process still cannot acquire
-      assert :ok = FastGlobalLock.unlock(key)
+      assert true = FastGlobalLock.unlock(key)
       refute in_new_process(fn -> FastGlobalLock.lock(key, 0) end)
 
       # Unlock again - now other process can acquire
-      assert :ok = FastGlobalLock.unlock(key)
-      assert true = in_new_process(fn -> FastGlobalLock.lock(key, 0) end)
-    end
-
-    test "nest?: false does not increment lock count" do
-      key = make_ref()
-
-      assert true = FastGlobalLock.lock(key, nest?: false)
-      assert true = FastGlobalLock.lock(key, nest?: false)
-
-      assert :ok = FastGlobalLock.unlock(key)
-
+      assert true = FastGlobalLock.unlock(key)
       assert true = in_new_process(fn -> FastGlobalLock.lock(key, 0) end)
     end
   end
@@ -208,7 +197,7 @@ defmodule FastGlobalLockTest do
       key = make_ref()
 
       assert true = FastGlobalLock.lock!(key)
-      assert :ok = FastGlobalLock.unlock(key)
+      assert true = FastGlobalLock.unlock(key)
     end
 
     test "lock! raises LockTimeoutError when timeout" do
@@ -222,108 +211,10 @@ defmodule FastGlobalLockTest do
     end
   end
 
-  describe "global-compatible interface" do
-    test "set_lock and del_lock work" do
-      key = make_ref()
-      global_id = {key, self()}
-
-      assert true = FastGlobalLock.set_lock(global_id)
-      assert true = FastGlobalLock.del_lock(global_id)
-
-      # `del_lock` always returns true
-      assert true = FastGlobalLock.del_lock(global_id)
-    end
-
-    test "lock requester ID is ignored" do
-      key = make_ref()
-      global_id1 = {key, :requester1}
-      global_id2 = {key, :requester2}
-
-      assert true = FastGlobalLock.set_lock(global_id1)
-      refute in_new_process(fn -> FastGlobalLock.set_lock(global_id2, [node()], 0) end)
-
-      # We can delete using the other global id
-      assert true = FastGlobalLock.del_lock(global_id2)
-      assert true = in_new_process(fn -> FastGlobalLock.set_lock(global_id2, [node()], 0) end)
-    end
-
-    test "del_lock fully unlocks regardless of nesting level" do
-      key = make_ref()
-      global_id = {key, self()}
-
-      assert true = FastGlobalLock.lock(key)
-      assert true = FastGlobalLock.lock(key)
-      assert true = FastGlobalLock.lock(key)
-
-      refute in_new_process(fn -> FastGlobalLock.lock(key, 0) end)
-
-      assert true = FastGlobalLock.del_lock(global_id)
-
-      assert true = in_new_process(fn -> FastGlobalLock.lock(key, 0) end)
-    end
-
-    test "set_lock with retries" do
-      key = make_ref()
-      global_id = {key, self()}
-
-      {:ok, _holder_pid} = Agent.start(fn -> FastGlobalLock.set_lock(global_id) end)
-
-      # Should fail with 0 retries
-      {us, _} =
-        :timer.tc(fn -> refute FastGlobalLock.set_lock(global_id, [node()], 0) end, :microsecond)
-
-      assert us < 1000
-
-      {us, _} =
-        :timer.tc(fn -> FastGlobalLock.set_lock(global_id, [node()], 1) end, :millisecond)
-
-      assert us in 125..374
-
-      {us, _} =
-        :timer.tc(fn -> FastGlobalLock.set_lock(global_id, [node()], 2) end, :millisecond)
-
-      assert us in 375..874
-    end
-
-    test "trans function" do
-      key = make_ref()
-      global_id = {key, self()}
-
-      assert :transaction_result =
-               FastGlobalLock.trans(global_id, fn -> :transaction_result end)
-    end
-
-    test "trans function with timeout" do
-      key = make_ref()
-      global_id = {key, self()}
-
-      {:ok, _holder_pid} = Agent.start(fn -> FastGlobalLock.set_lock(global_id) end)
-
-      assert :aborted =
-               FastGlobalLock.trans(global_id, fn -> :should_not_reach end, [node()], 0)
-    end
-
-    test "trans function only decrements lock count by one" do
-      key = make_ref()
-      global_id = {key, self()}
-
-      assert true = FastGlobalLock.lock(key)
-      assert true = FastGlobalLock.lock(key)
-
-      assert :trans_result = FastGlobalLock.trans(global_id, fn -> :trans_result end)
-
-      refute in_new_process(fn -> FastGlobalLock.lock(key, 0) end)
-
-      # After `trans`, we still have one lock left
-      assert :ok = FastGlobalLock.unlock(key)
-      assert {:error, _} = FastGlobalLock.unlock(key)
-    end
-  end
-
   describe "error conditions" do
     test "unlocking non-held lock is safe" do
       key = make_ref()
-      assert {:error, :not_locked} = FastGlobalLock.unlock(key)
+      refute FastGlobalLock.unlock(key)
     end
 
     test "unlocking from wrong process is safe" do
@@ -331,7 +222,7 @@ defmodule FastGlobalLockTest do
 
       {:ok, _holder_pid} = Agent.start(fn -> FastGlobalLock.lock(key) end)
 
-      assert {:error, :not_owner} = FastGlobalLock.unlock(key)
+      refute FastGlobalLock.unlock(key)
       refute FastGlobalLock.lock(key, 0)
     end
   end

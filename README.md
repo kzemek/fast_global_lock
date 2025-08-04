@@ -5,54 +5,55 @@
 [![Hex Docs](https://img.shields.io/badge/hex-docs-lightgreen.svg)](https://hexdocs.pm/fast_global_lock/)
 [![License](https://img.shields.io/hexpm/l/fast_global_lock.svg)](https://github.com/kzemek/fast_global_lock/blob/master/LICENSE)
 
-`FastGlobalLock` is a library that provides several features on top of [`:global`] lock mechanism.
+`FastGlobalLock` is a library that builds on top of [`:global`] to minimize the time between locks under contention and to provide a best-effort FIFO locking mechanism.
 
-- Adds process cooperation to minimize time from `lock/2` to the next `unlock/2` under contention.
-- Improves fairness, with processes likely to acquire locks in the order in which they called `lock/2` (FIFO).
-- Provides [`:global`]-compatibility API, while also defining a native API better aligned with its locking semantics.
+## Key differences from `:global`
 
-## Key differences from [`:global`]
-
-`FastGlobalLock`, being based on [`:global`], has very similar semantics.
+Because `FastGlobalLock` builds on `:global`, its lock semantics are similar.
 There are several key differences to be aware of:
 
-- When a process acquires a lock through `FastGlobalLock`, the actual lock in [`:global`] is owned by a separate linked process.
+| `:global`                                                                                         | `FastGlobalLock`                                                                   |
+| ------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| Relies solely on polling with an increasing, random sleep of up to 8 seconds.                     | Uses inter-process communication to minimize time between locks.                   |
+| Which process acquires a lock under contention is fully random.                                   | Orders pending locks and wakes waiting processes in FIFO order.                    |
+| Multiple processes can acquire the same lock if they use the same `LockRequesterId`.              | Only one process can hold a lock for a key on any given ndoe.                      |
+| Acquires at most one lock no matter how many [`set_lock/2`](`:global.set_lock/2`) calls are made. | Supports lock nesting in its native API.                                           |
+| Can release the lock only on selected nodes.                                                      | Always releases the lock everywhere it was acquired.                               |
+| Can extend the lock to more nodes.                                                                | If a lock for a `key` is already held, it can only be nested on the same node set. |
+| Takes a `Retries` argument and sleeps for a random time between attempts.                         | Takes a millisecond `timeout`.                                                     |
+| The process calling [`set_lock/2`](`:global.set_lock/2`) is monitored for liveness.               | A separate linked process is spawned per `lock/2` and monitored for liveness.      |
 
-- [`:global`] with `Retries>0` relies solely on polling with an increasing, random sleep of up to 8 seconds.
+## Important notes
 
-  - To minimize time between locks, `FastGlobalLock` uses inter-process communication to notify waiting peers that the lock can be acquired.
+### Increased CPU usage compared with `:global`
 
-- Any process can acquire the lock when calling [`:global.set_lock/3`]; later processes have a slightly better chance due to more frequent initial polling.
+`FastGlobalLock` shortens the wall-clock time between locks, but it achieves this by using **more** CPU time.
+A coordination layer on top of `:global` inevitably adds some processing overhead.
 
-  - `FastGlobalLock` orders pending locks and wakes up waiting processes in FIFO order.  
-    This is not a guarantee!
-    Other processes can still acquire the lock, if their attempt falls between `unlock` and handover, although it's an infrequent edge case.
+One particularly bad CPU scenario occurs when there is heavy contention for a key, with some processes locking on a single node while others lock cluster-wide.
+To determine if and where the lock is already present, `FastGlobalLock` probes the `:nodes` one at a time.
+It continues this loop without sleeping until it either acquires the lock or discovers that the key is locked elsewhere.
 
-- [`:global.set_lock/3`] allows multiple processes to acquire the same lock if they use the same `LockRequesterId`.
+This design is efficient when all requests target roughly the same set of nodes.
+However, if one process tries to lock 100 nodes while the lock is already held on just one of them, merely locating the lock can become expensive.
 
-  - This is unsupported in `FastGlobalLock`.
-    The `LockRequesterId` part of the `id` is ignored in its [`:global`] compatibility API.
+### Concurrent locks for disjoint node sets
 
-- [`:global`] only acquires one lock no matter the number of `set_lock` calls.
+Multiple concurrent locks (by different processes) can be acquired for the same key if they lock on disjoint `:nodes` sets.
+If processes attempt to acquire locks for `:nodes` spanning multiple existing locks, the fairness mechanism is likely to be disturbed.
+The fast locking mechanism still works in this scenario.
 
-  - `FastGlobalLock` supports lock nesting in its native API.
-
-- [`:global`] takes a `Retries` argument, and sleeps for a random (increasing) time between lock attempts.
-
-  - `FastGlobalLock` uses a millisecond `timeout` instead.
-    The compatibility API translates `retries` to the (average) timeout that [`:global`] would sleep before giving up.
-
-- [`:global`] gives an option to release the lock only on select nodes.
-  - `FastGlobalLock` always releases the lock everywhere it was acquired.
+Note that multiple concurrent locks for the same key cannot be acquired by the same process.
+`FastGlobalLock` will either nest the existing lock, or raise, depending on the `:on_nodes_mismatch` setting.
+See `lock/2` for more information.
 
 ## Correctness
 
-Correctness of `FastGlobalLock` is transitive from [`:global`].
-
-The lock holder process only calls functions that can time out.
-If any mechanism fails, it falls back to polling [`:global.set_lock/3`].
-
-In case of a bug in `FastGlobalLock` that would lead to lock-holder crash, the lock will be released, and the process that requested the lock will receive an exit signal.
+- `FastGlobalLock` inherits most of its correctness guarantees from `:global`.
+- If any mechanism fails, it falls back to polling [`:global.set_lock/3`].
+- While the lock-holder GenServer process is yet to acquire the lock, every callback either returns a timeout value or terminates the server altogether.
+- Should a bug in `FastGlobalLock` cause the lock-holder to crash, the lock is released automatically by `:global`.
+  The process that requested the lock will receive an exit signal through their link.
 
 ## Installation
 

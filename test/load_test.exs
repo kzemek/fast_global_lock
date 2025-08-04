@@ -73,6 +73,7 @@ defmodule FastGlobalLock.StressTest do
 
   alias FastGlobalLock
   alias FastGlobalLock.StressTest.RemoteHelpers
+  alias FastGlobalLock.TestHelper
 
   @moduletag type: :load
 
@@ -251,34 +252,18 @@ defmodule FastGlobalLock.StressTest do
     {:ok, _} = Node.start(:"test_origin_#{:os.getpid()}@localhost", :shortnames)
     on_exit(&Node.stop/0)
 
-    nodes =
-      for i <- 1..4 do
-        node_name = :"test_#{i}_#{:os.getpid()}"
-
-        {:ok, _peer, node} =
-          :peer.start_link(%{
-            name: node_name,
-            wait_boot: 5000
-          })
-
-        node
-      end
-
-    paths = :code.get_path()
-
-    :erpc.multicall(nodes, :code, :add_paths, [paths])
-    |> Enum.each(fn {:ok, _} -> :ok end)
-
-    :erpc.multicall(nodes, :code, :load_binary, [
-      RemoteHelpers,
-      ~c"#{__ENV__.file}",
-      unquote(helpers_bytecode)
-    ])
-    |> Enum.each(fn {:ok, _} -> :ok end)
-
     task_sups =
-      :erpc.multicall(nodes, RemoteHelpers, :start_task_supervisor, [])
-      |> Enum.map(fn {:ok, sup} -> sup end)
+      for _ <- 1..4 do
+        node = TestHelper.start_node()
+
+        :erpc.call(node, :code, :load_binary, [
+          RemoteHelpers,
+          ~c"#{__ENV__.file}",
+          unquote(helpers_bytecode)
+        ])
+
+        :erpc.call(node, RemoteHelpers, :start_task_supervisor, [])
+      end
 
     %{remote_task_sups: task_sups}
   end

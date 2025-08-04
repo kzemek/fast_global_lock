@@ -6,13 +6,20 @@ defmodule FastGlobalLock do
              |> String.replace("> [!IMPORTANT]", "> #### Important {: .info}")
 
   alias FastGlobalLock.Internal.LockHolder
-  alias FastGlobalLock.Internal.Utils
+  alias FastGlobalLock.{LockTimeoutError, NodesMismatchError}
+
+  import Record, only: [defrecordp: 2]
+
+  defrecordp :lock_info, lock_holder: nil, nodes: nil, count: 1
+
+  @typep lock_info ::
+           record(:lock_info, lock_holder: pid(), nodes: [node()], count: pos_integer())
 
   @typedoc "See `lock/2` for options' description."
   @type options :: [
           timeout: timeout(),
           nodes: [node()],
-          nest?: boolean()
+          on_nodes_mismatch: :ignore | :raise | :raise_if_minority_overlap
         ]
 
   @doc """
@@ -28,34 +35,67 @@ defmodule FastGlobalLock do
   the lock-count. While the current process is alive, it must call `unlock/2` the same number
   of times to release the lock.
 
+  #### Important {: .info}
+
+  If a key is already locked by this process, `FastGlobalLock` will not allow another lock to be
+  acquired, even if given a different set of nodes. See `:on_nodes_mismatch` option.
+
   ## Options
 
   - `:timeout` - a millisecond timeout after which the operation will fail. Defaults to `:infinity`
   - `:nodes` - nodes to lock on. Defaults to `Node.list([:this, :visible])`.
-  - `:nest?` - whether to increment the lock-count if the lock is already held by the current process.
-    Defaults to `true`.
+  - `:on_nodes_mismatch` - what to do if the lock is already held by this process on a different
+    set of nodes:
+    - `:ignore` - increment the lock-count without raising an error
+    - `:raise` - raise `FastGlobalLock.NodesMismatchError`
+    - `:raise_if_disjoint` - raise `FastGlobalLock.NodesMismatchError` if the requested `:nodes`
+      have no overlap with the existing lock's `:nodes`. Otherwise increment the lock-count.
+      This is the default setting.
+
+    #### Example
+
+        # Acquire the first lock
+        FastGlobalLock.lock(:foo, nodes: [:a, :b])
+
+        # Raises an error because of the nodes mismatch
+        # This would also happen if we didn't provide the `:nodes` option and the cluster membership
+        # changed between the first and second lock
+        FastGlobalLock.lock(:foo, nodes: [:a, :b, :c], on_nodes_mismatch: :raise)
+
+        # Won't fail as there's an overlap [:a] node with the existing lock's `nodes: [:a, :b]`
+        FastGlobalLock.lock(:foo, nodes: [:a, :c], on_nodes_mismatch: :raise_if_disjoint)
+
+        # Raises an error because the nodes are disjoint with the existing lock's `nodes: [:a, :b]`
+        FastGlobalLock.lock(:foo, nodes: [:c, :d], on_nodes_mismatch: :raise_if_disjoint)
+
+        # Won't fail no matter what the requested `:nodes` are
+        FastGlobalLock.lock(:foo, nodes: [:c, :d], on_nodes_mismatch: :ignore)
   """
   @spec lock(key :: any(), timeout() | options()) :: boolean()
   def lock(key, timeout_or_options \\ []) do
-    options = options(timeout_or_options)
+    options = ensure_options(timeout_or_options)
     nodes = options[:nodes]
     timeout = options[:timeout]
-    nest? = options[:nest?]
 
-    case Utils.whereis_lock(key, nodes) do
-      {on_behalf_of, {owner_pid, _lock_ref}} when on_behalf_of == self() ->
-        if nest?, do: GenServer.cast(owner_pid, :nest_lock)
-        true
-
-      _ when timeout == 0 ->
-        case GenServer.start_link(LockHolder, {key, nodes, self(), 0}) do
-          {:ok, _lock_holder} -> true
-          :ignore -> false
+    with nil <- process_dict_get_lock(key),
+         lock_info() = lock <- do_lock(key, nodes, timeout) do
+      process_dict_put_lock(key, lock)
+      true
+    else
+      lock_info(nodes: existing_nodes, count: count) = existing_lock ->
+        if nodes_mismatch?(options[:on_nodes_mismatch], existing_nodes, nodes) do
+          raise NodesMismatchError,
+            key: key,
+            owner: self(),
+            existing_nodes: existing_nodes,
+            requested_nodes: nodes
         end
 
-      _ ->
-        {:ok, lock_holder} = GenServer.start_link(LockHolder, {key, nodes, self(), timeout})
-        GenServer.call(lock_holder, :set_lock, :infinity)
+        process_dict_put_lock(key, lock_info(existing_lock, count: count + 1))
+        true
+
+      nil ->
+        false
     end
   end
 
@@ -65,49 +105,35 @@ defmodule FastGlobalLock do
   """
   @spec lock!(key :: any(), timeout() | options()) :: true | no_return()
   def lock!(key, timeout_or_options \\ []) do
-    options = options(timeout_or_options)
+    options = ensure_options(timeout_or_options)
 
     with false <- lock(key, options) do
-      raise FastGlobalLock.LockTimeoutError,
-        key: key,
-        nodes: options[:nodes],
-        timeout: options[:timeout]
+      raise LockTimeoutError, key: key, nodes: options[:nodes], timeout: options[:timeout]
     end
   end
 
   @doc """
-  Synchronously releases the lock on `key`.
+  Decrements the lock-count for `key`.
 
-  Unlike `:global.del_lock/2`, this function needs to be called the same number of times as `lock/2`
-  was called to acquire the lock.
+  If the lock-count is decremented to 0, the lock is synchronously released.
 
-  Returns:
-  - `:ok` if the lock was released
-  - `{:error, :not_owner}` if the current process is not the owner of the lock
-  - `{:error, :not_locked}` if the lock is not held by any process.
-
-  #### Important {: .info}
-
-  Unlike `m::global.del_lock/2`, `unlock/2` will release the lock on every node it was acquired with
-  `lock/2`.
-
-  The `:nodes` option given to this function is only used to determine the lock holder
-  process, and does not have to exactly match the nodes list used with `lock/2`.
-
-  ## Options
-
-  - `:nodes` - the nodes to unlock on. Defaults to all visible nodes.
+  Returns `true` if the lock-count was decremented, `false` if the lock is not held by the current
+  process.
   """
-  @spec unlock(key :: any(), nodes: [node()]) :: :ok | {:error, :not_owner | :not_locked}
-  def unlock(key, options \\ []) do
-    nodes = Keyword.get_lazy(options, :nodes, fn -> nodes() end)
+  @spec unlock(key :: any()) :: boolean()
+  def unlock(key) do
+    case process_dict_get_lock(key) do
+      lock_info(count: count) = lock_info when count > 1 ->
+        process_dict_put_lock(key, lock_info(lock_info, count: count - 1))
+        true
 
-    self = self()
+      lock_info(lock_holder: lock_holder) ->
+        GenServer.call(lock_holder, :del_lock, :infinity)
+        process_dict_del_lock(key)
+        true
 
-    case Utils.whereis_lock(key, nodes) do
-      {^self, {owner_pid, _lock_ref}} -> GenServer.call(owner_pid, :del_lock, :infinity)
-      {_on_behalf_of, _owner} -> {:error, :not_owner}
-      nil -> {:error, :not_locked}
+      nil ->
+        false
     end
   end
 
@@ -116,18 +142,19 @@ defmodule FastGlobalLock do
   The lock is released after `fun` finishes, whether it returns normally or with
   an exception/signal.
 
-  Returns `{:ok, result}` if the lock was acquired and `fun` returned normally,
+  Returns `{:ok, result}` if the lock was acquired and `fun` returned `result`,
   or `{:error, :lock_timeout}` if the lock was not acquired within the timeout.
 
   See `lock/2` for more details on options taken by this function.
   """
-  @spec with_lock(key :: any(), timeout() | options(), (-> any())) ::
-          {:ok, any()} | {:error, :lock_timeout}
+  @spec with_lock(key :: any(), timeout() | options(), (-> result)) ::
+          {:ok, result} | {:error, :lock_timeout}
+        when result: any()
   def with_lock(key, timeout_or_options \\ [], fun) do
-    options = options(timeout_or_options)
+    options = ensure_options(timeout_or_options)
 
     if lock(key, options),
-      do: {:ok, do_with_unlock(key, options, fun)},
+      do: {:ok, do_with_unlock(key, fun)},
       else: {:error, :lock_timeout}
   end
 
@@ -135,171 +162,69 @@ defmodule FastGlobalLock do
   Same as `with_lock/3`, but raises `FastGlobalLock.LockTimeoutError` if the lock is not acquired
   within the timeout.
   """
-  @spec with_lock!(key :: any(), timeout() | options(), (-> any())) :: any() | no_return()
+  @spec with_lock!(key :: any(), timeout() | options(), (-> result)) :: result | no_return()
+        when result: any()
   def with_lock!(key, timeout_or_options \\ [], fun) do
-    options = options(timeout_or_options)
+    options = ensure_options(timeout_or_options)
 
     lock!(key, options)
-    do_with_unlock(key, options, fun)
+    do_with_unlock(key, fun)
   end
 
-  defp do_with_unlock(key, options, fun) do
+  defp do_with_unlock(key, fun) do
     fun.()
   after
-    unlock(key, options)
+    unlock(key)
   end
 
-  defp options(timeout) when is_integer(timeout) or timeout == :infinity,
-    do: options(timeout: timeout)
+  @spec do_lock(key :: any(), nodes :: [node()], timeout()) :: lock_info() | nil
+  defp do_lock(key, nodes, 0 = _timeout) do
+    case GenServer.start_link(LockHolder, {key, nodes, self(), 0}) do
+      {:ok, lock_holder} -> lock_info(lock_holder: lock_holder, nodes: nodes)
+      :ignore -> nil
+    end
+  end
 
-  defp options(options) when is_list(options) do
-    [timeout: :infinity, nest?: true]
+  defp do_lock(key, nodes, timeout) do
+    {:ok, lock_holder} = GenServer.start_link(LockHolder, {key, nodes, self(), timeout})
+
+    if GenServer.call(lock_holder, :set_lock, :infinity),
+      do: lock_info(lock_holder: lock_holder, nodes: nodes)
+  end
+
+  defp nodes_mismatch?(:ignore, _existing_nodes, _requested_nodes),
+    do: false
+
+  defp nodes_mismatch?(:raise, existing_nodes, requested_nodes),
+    do: existing_nodes != requested_nodes
+
+  defp nodes_mismatch?(:raise_if_disjoint, existing_nodes, requested_nodes),
+    do: :ordsets.intersection(existing_nodes, requested_nodes) == []
+
+  @spec ensure_options(timeout() | options()) :: options()
+  defp ensure_options(timeout) when is_integer(timeout) or timeout == :infinity,
+    do: ensure_options(timeout: timeout)
+
+  defp ensure_options(options) when is_list(options) do
+    [timeout: :infinity, on_nodes_mismatch: :raise_if_disjoint]
     |> Keyword.merge(options)
-    |> Keyword.put_new_lazy(:nodes, fn -> nodes() end)
+    |> Keyword.put_new_lazy(:nodes, fn -> Node.list([:this, :visible]) end)
+    |> Keyword.update!(:nodes, &:ordsets.from_list/1)
   end
 
-  # Compatibility Interface
+  @spec process_dict_get_lock(key :: any()) :: lock_info() | nil
+  defp process_dict_get_lock(key),
+    do: Process.get({__MODULE__, :lock, key})
 
-  @typedoc "See `t::global.id/0`. `LockRequesterId` is ignored."
-  @type global_id :: {resource_id :: any(), lock_requester_id :: any()}
-
-  @typedoc "See `t::global.retries/0`. Translated to a millisecond timeout."
-  @type global_retries :: :infinity | non_neg_integer()
-
-  @doc """
-  `m::global`-compatible interface for `lock/2`.
-
-  #### Equivalent to
-  ```elixir
-  FastGlobalLock.set_lock(id, Node.list([:this, :visible]), :infinity)
-  ```
-  """
-  @doc group: "Compatibility Interface"
-  @spec set_lock(global_id()) :: boolean()
-  def set_lock(id),
-    do: set_lock(id, nodes(), :infinity)
-
-  @doc """
-  `m::global`-compatible interface for `lock/2`.
-
-  The `id` argument has to be a tuple of `{resource_id, lock_requester_id}`. `lock_requester_id` is
-  ignored by `FastGlobalLock`.
-
-  The number of `retries` is translated to the (average) timeout that `m::global` would sleep before
-  giving up:
-
-  | **Retries** | 0 | 1 | 2 | 3 | 4 | 5 + n |
-  | **Timeout** | 0ms | 125ms | 375ms | 875ms | 1875ms | 3875ms + n*4000ms |
-
-  #### Equivalent to
-
-  ```elixir
-  timeout = global_retries_to_timeout(retries)
-  FastGlobalLock.lock(resource_id, nodes: nodes, timeout: timeout, nest?: false)
-  ```
-  """
-  @doc group: "Compatibility Interface"
-  @spec set_lock(global_id(), [node()], global_retries()) :: boolean()
-  def set_lock({key, _requester}, nodes, retries \\ :infinity),
-    do: lock(key, nodes: nodes, timeout: global_retries_to_timeout(retries))
-
-  @doc """
-  `m::global`-compatible interface for `unlock/2`.
-
-  #### Equivalent to
-
-  ```elixir
-  FastGlobalLock.del_lock(id, Node.list([:this, :visible]))
-  ```
-  """
-  @doc group: "Compatibility Interface"
-  @spec del_lock(global_id()) :: true
-  def del_lock(id),
-    do: del_lock(id, nodes())
-
-  @doc """
-  `m::global`-compatible interface for `unlock/2`.
-
-  The `id` argument has to be a tuple of `{resource_id, lock_requester_id}`. `lock_requester_id` is
-  ignored by `FastGlobalLock`.
-
-  This function will fully unlock `resource_id` no matter how many times it was nested, and will
-  always return `true`.
-
-  See `unlock/2` for more details on how the `:nodes` option is used.
-  """
-  @doc group: "Compatibility Interface"
-  @spec del_lock(global_id(), [node()]) :: true
-  def del_lock({key, _requester}, nodes) do
-    Stream.repeatedly(fn -> unlock(key, nodes: nodes) end)
-    |> Stream.take_while(&(&1 == :ok))
-    |> Stream.run()
-
-    true
+  @spec process_dict_put_lock(key :: any(), lock_info()) :: :ok
+  defp process_dict_put_lock(key, lock_info() = lock_info) do
+    Process.put({__MODULE__, :lock, key}, lock_info)
+    :ok
   end
 
-  @doc """
-  `m::global`-compatible interface for `with_lock/3`.
-
-  #### Equivalent to
-
-  ```elixir
-  FastGlobalLock.trans(id, fun, Node.list([:this, :visible]), :infinity)
-  ```
-  """
-  @doc group: "Compatibility Interface"
-  @spec trans(global_id(), (-> any())) :: any() | :aborted
-  def trans(id, fun),
-    do: trans(id, fun, nodes(), :infinity)
-
-  @doc """
-  `m::global`-compatible interface for `with_lock/3`.
-
-  The `id` argument has to be a tuple of `{resource_id, lock_requester_id}`. `lock_requester_id` is
-  ignored by `FastGlobalLock`.
-
-  #### Important {: .info}
-
-  Note that this function will only decrement the lock-count by one.
-  If `lock/2` was previously called on this `key` with `nest?: true` (default), then the lock will
-  still be held after `fun` finishes.
-
-  To avoid clashing semantics, `m::global`-compatible interface *should not be mixed* with
-  `FastGlobalLock`'s native API.
-
-  #### Equivalent to
-
-  ```elixir
-  timeout = global_retries_to_timeout(retries)
-  FastGlobalLock.with_lock(key, [nodes: nodes, timeout: timeout, nest?: false], fun)
-  ```
-  """
-  @doc group: "Compatibility Interface"
-  @spec trans(global_id(), (-> any()), [node()], global_retries()) :: any() | :aborted
-  def trans({key, _requester}, fun, nodes, retries \\ :infinity) do
-    timeout = global_retries_to_timeout(retries)
-
-    case with_lock(key, [nodes: nodes, timeout: timeout, nest?: false], fun) do
-      {:ok, result} -> result
-      {:error, :lock_timeout} -> :aborted
-    end
-  end
-
-  defp nodes,
-    do: Node.list([:this, :visible])
-
-  defp global_retries_to_timeout(retries) do
-    # Translates :global.retries() to an average millisecond timeout they correspond to.
-    # :global uses a random sleep between 0 and 1/4, 1/2, 1, 2, 4, 8, 8, 8, ... seconds, depending
-    # on which retry we're on.
-    case retries do
-      :infinity -> :infinity
-      0 -> 0
-      1 -> 125
-      2 -> 375
-      3 -> 875
-      4 -> 1875
-      x when x >= 5 -> 3875 + (x - 5) * 4000
-    end
+  @spec process_dict_del_lock(key :: any()) :: :ok
+  defp process_dict_del_lock(key) do
+    Process.delete({__MODULE__, :lock, key})
+    :ok
   end
 end

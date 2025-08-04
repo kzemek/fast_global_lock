@@ -16,7 +16,7 @@ defmodule FastGlobalLock.FairnessTest do
             if result do
               # Hold briefly
               Process.sleep(50)
-              FastGlobalLock.unlock(key)
+              true = FastGlobalLock.unlock(key)
             end
 
             result
@@ -50,7 +50,7 @@ defmodule FastGlobalLock.FairnessTest do
             if result do
               # Hold briefly
               Process.sleep(1)
-              FastGlobalLock.unlock(key)
+              true = FastGlobalLock.unlock(key)
             end
 
             {result, start_time, end_time}
@@ -95,7 +95,7 @@ defmodule FastGlobalLock.FairnessTest do
               if result do
                 # Hold briefly
                 Process.sleep(1)
-                FastGlobalLock.unlock(key)
+                true = FastGlobalLock.unlock(key)
               end
 
               result
