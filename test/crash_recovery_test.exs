@@ -15,8 +15,8 @@ defmodule FastGlobalLock.CrashRecoveryTest do
 
       Agent.stop(pid, :kill)
 
-      # Another process should be able to acquire the lock
-      assert FastGlobalLock.lock(key, 0)
+      # Another process should be able to acquire the lock as soon as :global notices
+      assert FastGlobalLock.lock(key, 1)
     end
 
     test "lock is released when holder process dies" do
