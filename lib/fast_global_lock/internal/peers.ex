@@ -122,12 +122,19 @@ defmodule FastGlobalLock.Internal.Peers do
 
   defp receive_dead_peers(reqids, peers_by_node, acc \\ []) do
     case :erpc.receive_response(reqids, @erpc_timeout, true) do
-      :no_request -> acc
-      {dead_peers, _node, reqids} -> receive_dead_peers(reqids, peers_by_node, [dead_peers | acc])
+      :no_request ->
+        acc
+
+      {dead_peers, node, reqids} ->
+        peers_by_node = Map.delete(peers_by_node, node)
+        receive_dead_peers(reqids, peers_by_node, [dead_peers | acc])
     end
   catch
+    :error, {:erpc, :timeout} ->
+      [Map.values(peers_by_node) | acc]
+
     :error, {_reason, node, reqids} ->
-      dead_peers = Map.fetch!(peers_by_node, node)
+      {dead_peers, peers_by_node} = Map.pop!(peers_by_node, node)
       receive_dead_peers(reqids, peers_by_node, [dead_peers | acc])
   end
 end
