@@ -62,7 +62,7 @@ The package can be installed by adding `fast_global_lock` to your list of depend
 ```elixir
 def deps do
   [
-    {:fast_global_lock, "~> 0.1.1"}
+    {:fast_global_lock, "~> 0.1.2"}
   ]
 end
 ```
