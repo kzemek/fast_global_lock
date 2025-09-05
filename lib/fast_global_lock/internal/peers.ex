@@ -27,18 +27,29 @@ defmodule FastGlobalLock.Internal.Peers do
   def contains?(%__MODULE__{} = peers, peer),
     do: MapSet.member?(peers.known, peer)
 
-  def add(%__MODULE__{} = peers, peer) do
+  def add(%__MODULE__{} = peers, peer_or_peers) do
+    peer_or_peers
+    |> List.wrap()
+    |> Enum.reduce(peers, &add_nomaintain(&2, &1))
+    |> maintain()
+  end
+
+  def add_nomaintain(%__MODULE__{} = peers, peer) do
     if contains?(peers, peer) do
       peers
     else
       rest = :queue.in(peer, peers.rest)
       known = MapSet.put(peers.known, peer)
-      maintain(%{peers | rest: rest, known: known})
+      %{peers | rest: rest, known: known}
     end
   end
 
-  def remove(%__MODULE__{} = peers, peer),
-    do: peers |> remove_nomaintain(peer) |> maintain()
+  def remove(%__MODULE__{} = peers, peer_or_peers) do
+    peer_or_peers
+    |> List.wrap()
+    |> Enum.reduce(peers, &remove_nomaintain(&2, &1))
+    |> maintain()
+  end
 
   defp remove_nomaintain(%__MODULE__{} = peers, peer) do
     cond do

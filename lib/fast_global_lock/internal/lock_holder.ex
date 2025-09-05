@@ -75,11 +75,25 @@ defmodule FastGlobalLock.Internal.LockHolder do
     end
   end
 
-  def handle_call({:peer_awaiting_lock, peer}, _from, %State{had_lock?: true} = state),
-    do: {:reply, true, %{state | peers: Peers.add(state.peers, peer)}}
+  def handle_call({:peer_awaiting_lock, peer}, from, %State{} = state) do
+    peers_awaiting_lock_rest =
+      Stream.unfold(nil, fn _ ->
+        receive do
+          {:"$gen_call", from, {:peer_awaiting_lock, peer}} -> {{from, peer}, nil}
+        after
+          0 -> nil
+        end
+      end)
 
-  def handle_call({:peer_awaiting_lock, _peer}, _from, %State{} = state),
-    do: {:reply, false, state, timeout(state)}
+    {froms, awaiting_peers} =
+      Enum.concat([{from, peer}], peers_awaiting_lock_rest) |> Enum.unzip()
+
+    Enum.each(froms, &GenServer.reply(&1, state.had_lock?))
+
+    if state.had_lock?,
+      do: {:noreply, %{state | peers: Peers.add(state.peers, awaiting_peers)}},
+      else: {:noreply, state, timeout(state)}
+  end
 
   @impl GenServer
   def handle_continue({:take_over_peers, peers}, %State{} = state) do
@@ -119,13 +133,22 @@ defmodule FastGlobalLock.Internal.LockHolder do
     end
   end
 
-  def handle_info({:DOWN, _, :process, peer, _reason}, %State{has_lock?: true} = state) do
-    peers = Peers.remove(state.peers, peer)
-    {:noreply, %{state | peers: peers}}
-  end
+  def handle_info({:DOWN, _, :process, peer, _reason}, %State{} = state) do
+    downed_peers_rest =
+      Stream.unfold(nil, fn _ ->
+        receive do
+          {:DOWN, _ref, :process, peer, _reason} -> {peer, nil}
+        after
+          0 -> nil
+        end
+      end)
 
-  def handle_info({:DOWN, _ref, :process, _pid, _reason}, %State{} = state),
-    do: {:noreply, state, 0}
+    downed_peers = Enum.concat([peer], downed_peers_rest)
+
+    if state.has_lock?,
+      do: {:noreply, %{state | peers: Peers.remove(state.peers, downed_peers)}},
+      else: {:noreply, state, 0}
+  end
 
   def handle_info({ref, _late_genserver_reply}, %State{} = state) when is_reference(ref),
     do: if(state.has_lock?, do: {:noreply, state}, else: {:noreply, state, 0})
