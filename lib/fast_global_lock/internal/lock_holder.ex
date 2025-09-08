@@ -11,6 +11,8 @@ defmodule FastGlobalLock.Internal.LockHolder do
   @poll_jitter to_timeout(millisecond: 200)
   @poll_min_interval to_timeout(millisecond: 10)
   @handover_timeout to_timeout(millisecond: 100)
+  @max_notify_attempts_between_sleep 4
+  @backoff [base: 4, max: to_timeout(second: 2), attempt_cutoff: 12]
 
   @enforce_keys [:resource, :nodes]
   defstruct [
@@ -20,7 +22,8 @@ defmodule FastGlobalLock.Internal.LockHolder do
     notified_owner: nil,
     peers: Peers.new(),
     has_lock?: false,
-    had_lock?: false
+    had_lock?: false,
+    attempt: 0
   ]
 
   @typep state :: %State{
@@ -30,7 +33,8 @@ defmodule FastGlobalLock.Internal.LockHolder do
            notified_owner: pid() | nil,
            peers: Peers.t(),
            had_lock?: boolean(),
-           has_lock?: boolean()
+           has_lock?: boolean(),
+           attempt: non_neg_integer()
          }
 
   @impl GenServer
@@ -168,11 +172,11 @@ defmodule FastGlobalLock.Internal.LockHolder do
     case try_lock_once(state) do
       %State{has_lock?: true} = locked_state ->
         GenServer.reply(state.parent, true)
-        locked_state
+        %{locked_state | attempt: 0}
 
       %State{} = state ->
         {lock_found?, state} = notify_lock_owner(state)
-        if lock_found?, do: state, else: try_lock(state)
+        %{state | attempt: if(lock_found?, do: 0, else: state.attempt + 1)}
     end
   end
 
@@ -210,7 +214,15 @@ defmodule FastGlobalLock.Internal.LockHolder do
   end
 
   @spec notify_lock_owner(state()) :: {boolean(), state()}
-  defp notify_lock_owner(%State{} = state) do
+  defp notify_lock_owner(%State{} = state),
+    do: notify_lock_owner(state, 1)
+
+  @spec notify_lock_owner(state(), attempt :: pos_integer()) :: {boolean(), state()}
+  defp notify_lock_owner(%State{} = state, attempt)
+       when attempt > @max_notify_attempts_between_sleep,
+       do: {false, state}
+
+  defp notify_lock_owner(%State{} = state, attempt) do
     previously_notified_owner = state.notified_owner
 
     case whereis_lock(state.resource, state.nodes) do
@@ -226,16 +238,21 @@ defmodule FastGlobalLock.Internal.LockHolder do
         try do
           if GenServer.call(new_owner, {:peer_awaiting_lock, self()}, @handover_timeout),
             do: {true, %{state | notified_owner: new_owner}},
-            else: notify_lock_owner(state)
+            else: notify_lock_owner(state, attempt + 1)
         catch
-          :exit, _ -> notify_lock_owner(state)
+          :exit, _ -> notify_lock_owner(state, attempt + 1)
         end
     end
   end
 
   @spec timeout(state()) :: non_neg_integer()
+  defp timeout(%State{attempt: attempt}) when attempt > 0 do
+    delay = min(@backoff[:max], @backoff[:base] ** min(attempt - 1, @backoff[:attempt_cutoff]))
+    ceil(delay / 2) + Enum.random(0..delay)
+  end
+
   defp timeout(_state),
-    do: max(@poll_interval + :rand.uniform(@poll_jitter) * 2 - @poll_jitter, @poll_min_interval)
+    do: max(@poll_interval + Enum.random(-@poll_jitter..@poll_jitter), @poll_min_interval)
 
   @spec whereis_lock(any(), [node()]) :: pid() | nil
   defp whereis_lock(resource, nodes) do
