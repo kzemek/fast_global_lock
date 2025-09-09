@@ -4,7 +4,7 @@ defmodule FastGlobalLock.MixProject do
   def project do
     [
       app: :fast_global_lock,
-      version: "0.1.2",
+      version: "0.1.3",
       description: "Fast and fair :global-based lock for Elixir",
       package: package(),
       source_url: "https://github.com/kzemek/fast_global_lock",
